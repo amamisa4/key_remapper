@@ -122,6 +122,21 @@ ctrl_pressed  = False
 hooked_vk     = None
 
 
+def reset_modifier_states():
+    """
+    スリープ復帰・ロック解除時など、修飾キーのUPイベントを取り逃がした場合に
+    全修飾キー状態をリセットする。
+    GetAsyncKeyState で物理状態を再確認し、押されていないキーだけ False にする。
+    """
+    global win_pressed, shift_pressed, alt_pressed, ctrl_pressed, hooked_vk
+    win_pressed   = is_physically_down(VK_LWIN)  or is_physically_down(VK_RWIN)
+    shift_pressed = is_physically_down(VK_LSHIFT) or is_physically_down(VK_RSHIFT)
+    alt_pressed   = is_physically_down(VK_LMENU)  or is_physically_down(VK_RMENU)
+    ctrl_pressed  = is_physically_down(VK_LCONTROL) or is_physically_down(VK_RCONTROL)
+    if not win_pressed:
+        hooked_vk = None
+
+
 # ── フックコールバック ──────────────────────────────────────
 LowLevelKeyboardProc = CFUNCTYPE(c_int, c_int, wt.WPARAM, POINTER(KBDLLHOOKSTRUCT))
 
@@ -142,6 +157,19 @@ def hook_proc(nCode, wParam, lParam):
         return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     # ── 修飾キーの追跡 ─────────────────────────────────────
+    # スリープ/ロック復帰後に修飾キーのUPイベントを取り逃がすことがある。
+    # 任意のキーイベント受信時に物理状態を再確認して補正する。
+    if not is_physically_down(VK_LWIN) and not is_physically_down(VK_RWIN):
+        if win_pressed:
+            win_pressed = False
+            hooked_vk   = None
+    if not is_physically_down(VK_LSHIFT) and not is_physically_down(VK_RSHIFT):
+        shift_pressed = False
+    if not is_physically_down(VK_LMENU) and not is_physically_down(VK_RMENU):
+        alt_pressed = False
+    if not is_physically_down(VK_LCONTROL) and not is_physically_down(VK_RCONTROL):
+        ctrl_pressed = False
+
     if vk in (VK_LWIN, VK_RWIN):
         if is_down:
             win_pressed = True
@@ -334,11 +362,18 @@ def hook_proc(nCode, wParam, lParam):
         return 1
 
     # Ctrl + Space → Enter
+    # Ctrl を押したまま Enter を送ると受信側が Ctrl+Enter と解釈するため、
+    # Alt+A/S と同様に Ctrl を一時解放してから Enter を送る。
     if ctrl_pressed and vk == 0x20 and is_down:
         send_keys(
-            (VK_RETURN, False),
-            (VK_RETURN, True),
+            (VK_LCONTROL, True),    # Ctrl を一時解放
+            (VK_RETURN,   False),
+            (VK_RETURN,   True),
         )
+        # 物理的にまだ Ctrl が押されていれば押し直す
+        ctrl_pressed = is_physically_down(VK_LCONTROL) or is_physically_down(VK_RCONTROL)
+        if ctrl_pressed:
+            send_keys((VK_LCONTROL, False))
         return 1
 
     # Win + C → AI をブラウザで開く。どのAIかはお好みで。
@@ -363,6 +398,71 @@ def hook_proc(nCode, wParam, lParam):
     return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
 
+# ── 電源・セッション変化通知用の非表示ウィンドウ ──────────────
+# WM_POWERBROADCAST / WM_WTSSESSION_CHANGE はウィンドウプロシージャ経由でのみ受信できる。
+# スリープ復帰・ロック解除時に修飾キー状態をリセットするために使用する。
+WM_POWERBROADCAST   = 0x0218
+PBT_APMRESUMEAUTOMATIC = 0x0012  # スリープ復帰（自動）
+PBT_APMRESUMESUSPEND   = 0x0007  # スリープ復帰（ユーザー操作）
+WM_WTSSESSION_CHANGE   = 0x02B1
+WTS_SESSION_UNLOCK     = 0x0008  # ロック解除
+
+WNDPROCTYPE = ctypes.CFUNCTYPE(ctypes.c_long, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style",         wt.UINT),
+        ("lpfnWndProc",   WNDPROCTYPE),
+        ("cbClsExtra",    ctypes.c_int),
+        ("cbWndExtra",    ctypes.c_int),
+        ("hInstance",     wt.HINSTANCE),
+        ("hIcon",         wt.HANDLE),
+        ("hCursor",       wt.HANDLE),
+        ("hbrBackground", wt.HANDLE),
+        ("lpszMenuName",  wt.LPCWSTR),
+        ("lpszClassName", wt.LPCWSTR),
+    ]
+
+def _make_notify_window():
+    """
+    スリープ復帰・ロック解除通知を受け取るための非表示ウィンドウを生成する。
+    通知を受信したら reset_modifier_states() を呼ぶ。
+    """
+    hinstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+    class_name = "KeyRemapperNotify"
+
+    def wnd_proc(hwnd, msg, wparam, lparam):
+        if msg == WM_POWERBROADCAST:
+            if wparam in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND):
+                reset_modifier_states()
+        elif msg == WM_WTSSESSION_CHANGE:
+            if wparam == WTS_SESSION_UNLOCK:
+                reset_modifier_states()
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    # コールバックをグローバルに保持してGC回収を防ぐ
+    global _wnd_proc_ref
+    _wnd_proc_ref = WNDPROCTYPE(wnd_proc)
+
+    wc = WNDCLASSW()
+    wc.lpfnWndProc   = _wnd_proc_ref
+    wc.hInstance     = hinstance
+    wc.lpszClassName = class_name
+    ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
+
+    hwnd = ctypes.windll.user32.CreateWindowExW(
+        0, class_name, class_name,
+        0, 0, 0, 0, 0,
+        None, None, hinstance, None,
+    )
+
+    # セッション変化通知を登録（WM_WTSSESSION_CHANGE を受け取るために必要）
+    ctypes.windll.wtsapi32.WTSRegisterSessionNotification(hwnd, 0)
+    return hwnd
+
+_wnd_proc_ref = None  # GC回収防止用グローバル
+
+
 # ── メインループ ───────────────────────────────────────────
 def main():
     if not ctypes.windll.shell32.IsUserAnAdmin():
@@ -379,6 +479,9 @@ def main():
     if not hook:
         print("[ERROR] フックの設置に失敗しました。")
         sys.exit(1)
+
+    # スリープ復帰・ロック解除通知用ウィンドウを生成
+    _make_notify_window()
 
     print("起動しました。")
     print("  Win+Q        -> Win+Left          (ウィンドウを左にスナップ)")
