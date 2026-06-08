@@ -157,12 +157,12 @@ def hook_proc(nCode, wParam, lParam):
         return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     # ── 修飾キーの追跡 ─────────────────────────────────────
-    # スリープ/ロック復帰後に修飾キーのUPイベントを取り逃がすことがある。
-    # 任意のキーイベント受信時に物理状態を再確認して補正する。
-    if not is_physically_down(VK_LWIN) and not is_physically_down(VK_RWIN):
-        if win_pressed:
-            win_pressed = False
-            hooked_vk   = None
+    # Shift/Alt/Ctrl については、スリープ復帰後のUP取り逃がし対策として
+    # GetAsyncKeyState で物理状態を補正する。
+    # Win キーは SendInput で Win UP を送った直後に GetAsyncKeyState が
+    # 「離された」と返すことがあり、Win+Q 連打などを誤ってキャンセルしてしまう。
+    # Win の誤残留はメッセージウィンドウ側（WM_POWERBROADCAST / WM_WTSSESSION_CHANGE）
+    # で reset_modifier_states() を呼ぶことで対処済みのため、ここでは補正しない。
     if not is_physically_down(VK_LSHIFT) and not is_physically_down(VK_RSHIFT):
         shift_pressed = False
     if not is_physically_down(VK_LMENU) and not is_physically_down(VK_RMENU):
