@@ -1,2 +1,4 @@
 pystray
 pillow
+pyvda
+pywin32

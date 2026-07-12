@@ -17,7 +17,7 @@ import os
 import sys
 
 # ── ここを切り替えるだけでログのON/OFFが変わる ──────────────
-ENABLE_LOG = False
+ENABLE_LOG = True
 # ────────────────────────────────────────────────────────────
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key_remapper.log")
@@ -52,3 +52,19 @@ def info(msg: str):
 def warning(msg: str):
     if ENABLE_LOG:
         _logger.warning(msg)
+
+def exception(msg: str):
+    """直近の例外のスタックトレース付きでログする（except節の中から呼ぶ）。"""
+    if ENABLE_LOG:
+        _logger.exception(msg)
+    else:
+        # ログ無効時も、pythonw.exeではstderrが無く例外が完全に握りつぶされて
+        # しまうため、無効時でも最低限ファイルへ書き出す（診断用の安全弁）。
+        import traceback
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[EXCEPTION] {msg}\n")
+                f.write(traceback.format_exc())
+                f.write("\n")
+        except Exception:
+            pass

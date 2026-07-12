@@ -19,9 +19,10 @@ from ctypes import CFUNCTYPE, c_int, POINTER, cast
 import pystray
 from PIL import Image
 
-import window_resize  # ウィンドウサイズ変更モジュール
-import calc_overlay   # Alt+Space の電卓オーバーレイモジュール
-import key_logger     # ログユーティリティ（key_logger.py の ENABLE_LOG で ON/OFF）
+import window_resize   # ウィンドウサイズ変更モジュール
+import calc_overlay    # Alt+Space の電卓オーバーレイモジュール
+import virtual_desktop  # 仮想デスクトップ切り替え・ウィンドウ移動モジュール
+import key_logger      # ログユーティリティ（key_logger.py の ENABLE_LOG で ON/OFF）
 
 # ── フック識別子（Hook IDs） ──────────────────────────────────
 WH_KEYBOARD_LL      = 13      # グローバル低レベルキーボードフック（Low-Level Keyboard Hook）
@@ -44,6 +45,7 @@ VK_Y                = 0x59    # Yキー
 VK_V                = 0x56    # Vキー
 VK_A                = 0x41    # Aキー
 VK_S                = 0x53    # Sキー
+VK_D                = 0x44    # Dキー
 VK_H                = 0x48    # Hキー
 VK_LEFT             = 0x25    # 左矢印キー（Left Arrow）
 VK_RIGHT            = 0x27    # 右矢印キー（Right Arrow）
@@ -294,31 +296,20 @@ def hook_proc(nCode, wParam, lParam):
         )
         return 1
 
-    # # Win + Shift + Z → Win + Shift + Left
-    # if win_pressed and shift_pressed and vk == VK_Z and is_down:
-    #     hooked_vk = VK_Z
-    #     send_keys(
-    #         (VK_LWIN,   False),
-    #         (VK_LSHIFT, False),
-    #         (VK_LEFT,   False),
-    #         (VK_LEFT,   True),
-    #         (VK_LSHIFT, True),
-    #         (VK_LWIN,   True),
-    #     )
-    #     return 1
+    # Alt + Shift + Z → アクティブウィンドウを左の仮想デスクトップに移動して切り替え
+    if alt_pressed and shift_pressed and vk == VK_Z and is_down:
+        virtual_desktop.move_left(switch=True)
+        return 1
 
-    # # Win + Shift + X → Win + Shift + Right
-    # if win_pressed and shift_pressed and vk == VK_X and is_down:
-    #     hooked_vk = VK_X
-    #     send_keys(
-    #         (VK_LWIN,   False),
-    #         (VK_LSHIFT, False),
-    #         (VK_RIGHT,  False),
-    #         (VK_RIGHT,  True),
-    #         (VK_LSHIFT, True),
-    #         (VK_LWIN,   True),
-    #     )
-    #     return 1
+    # Alt + Shift + X → アクティブウィンドウを右の仮想デスクトップに移動して切り替え
+    if alt_pressed and shift_pressed and vk == VK_X and is_down:
+        virtual_desktop.move_right(switch=True)
+        return 1
+
+    # Alt + Shift + D → ウィンドウのピン留め（全デスクトップ表示）を切り替え
+    if alt_pressed and shift_pressed and vk == VK_D and is_down:
+        virtual_desktop.toggle_pin_window()
+        return 1
 
     # F1 → Win + H（音声入力）
     # Alt を押していない場合のみ発火
@@ -391,37 +382,15 @@ def hook_proc(nCode, wParam, lParam):
             send_keys((VK_LMENU, False))
         return 1
 
-    # # Alt + Q → Ctrl + Win + Left
-    # if alt_pressed and vk == VK_Q and is_down:
-    #     send_keys(
-    #         (VK_LMENU,    True),   # Alt を一時解放
-    #         (VK_LCONTROL, False),
-    #         (VK_LWIN,     False),
-    #         (VK_LEFT,     False),
-    #         (VK_LEFT,     True),
-    #         (VK_LWIN,     True),
-    #         (VK_LCONTROL, True),
-    #     )
-    #     alt_pressed = is_physically_down(VK_LMENU) or is_physically_down(VK_RMENU)
-    #     if alt_pressed:
-    #         send_keys((VK_LMENU, False))
-    #     return 1
+    # Alt + Q → 仮想デスクトップを左へ切り替え
+    if alt_pressed and not shift_pressed and vk == VK_Q and is_down:
+        virtual_desktop.switch_left()
+        return 1
 
-    # # Alt + W → Ctrl + Win + Right
-    # if alt_pressed and vk == VK_W and is_down:
-    #     send_keys(
-    #         (VK_LMENU,    True),   # Alt を一時解放
-    #         (VK_LCONTROL, False),
-    #         (VK_LWIN,     False),
-    #         (VK_RIGHT,    False),
-    #         (VK_RIGHT,    True),
-    #         (VK_LWIN,     True),
-    #         (VK_LCONTROL, True),
-    #     )
-    #     alt_pressed = is_physically_down(VK_LMENU) or is_physically_down(VK_RMENU)
-    #     if alt_pressed:
-    #         send_keys((VK_LMENU, False))
-    #     return 1
+    # Alt + W → 仮想デスクトップを右へ切り替え
+    if alt_pressed and not shift_pressed and vk == VK_W and is_down:
+        virtual_desktop.switch_right()
+        return 1
 
     # Ctrl + Space → Enter
     # Ctrl を押したまま Enter を送ると受信側が Ctrl+Enter と解釈するため、
@@ -653,8 +622,11 @@ def main():
     print("  Win+Shift+X  -> Win+Shift+Right   (ウィンドウを右モニターへ移動)")
     print("  Alt+A        -> Left              (左矢印)")
     print("  Alt+S        -> Right             (右矢印)")
-    print("  Alt+Q        -> Ctrl+Win+Left     (仮想デスクトップを左へ)")
-    print("  Alt+W        -> Ctrl+Win+Right    (仮想デスクトップを右へ)")
+    print("  Alt+Q                             (仮想デスクトップを左へ切り替え)")
+    print("  Alt+W                             (仮想デスクトップを右へ切り替え)")
+    print("  Alt+Shift+Z                       (ウィンドウを左の仮想デスクトップへ移動して切り替え)")
+    print("  Alt+Shift+X                       (ウィンドウを右の仮想デスクトップへ移動して切り替え)")
+    print("  Alt+Shift+D                       (ウィンドウのピン留め[全デスクトップ表示]を切り替え)")
     print("  F1           -> Win+H             (音声入力)")
     print("  Win+Esc      -> Media Play/Pause  (再生/一時停止)")
     print("  Alt+C        -> Ctrl+Win+V        (クリップボード履歴)")
