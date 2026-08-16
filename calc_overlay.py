@@ -8,7 +8,7 @@ WindowsのEDITコントロールは可視スタイルのテーマ描画がWM_CTL
 削除もWM_CHAR/WM_KEYDOWNを自前でハンドリングする。
 
 Enterまたは"="キーで入力された式を評価し、「式 = 結果」の形で表示する。
-Ctrl+Vではクリップボードの数値を式側へ貼り付ける。
+Ctrl+Cでは表示中の結果をコピーし、Ctrl+Vではクリップボードの数値を式側へ貼り付ける。
 Escキーで閉じる。
 
 式の評価は eval() を使わず、ast モジュールで四則演算のみを許可した
@@ -61,8 +61,10 @@ VK_HOME          = 0x24
 VK_END           = 0x23
 VK_DELETE        = 0x2E
 VK_CONTROL       = 0x11
+VK_C             = 0x43
 VK_V             = 0x56
 CF_UNICODETEXT   = 13
+GMEM_MOVEABLE    = 0x0002
 MONITOR_DEFAULTTONEAREST = 0x00000002
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
 DWMWCP_ROUND = 2
@@ -86,9 +88,15 @@ user32.DefWindowProcW.restype  = ctypes.c_ssize_t
 user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 user32.GetClipboardData.restype = wt.HANDLE
 user32.GetClipboardData.argtypes = [wt.UINT]
+user32.SetClipboardData.restype = wt.HANDLE
+user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+kernel32.GlobalAlloc.restype = wt.HGLOBAL
+kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
 kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+kernel32.GlobalFree.restype = wt.HGLOBAL
+kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -273,6 +281,66 @@ def _read_clipboard_text(hwnd):
         user32.CloseClipboard()
 
 
+def _get_displayed_result(text):
+    """「式 = 結果」の表示からコピー可能な結果だけを返す。"""
+    separator = " = "
+    if separator not in text:
+        return None
+    result = text.split(separator, 1)[1].strip()
+    if not result or result == "エラー":
+        return None
+    return result
+
+
+def _write_clipboard_text(hwnd, text):
+    """Unicode文字列をWindowsクリップボードへ書き込む。"""
+    encoded = text.encode("utf-16-le") + b"\x00\x00"
+    data_handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+    if not data_handle:
+        key_logger.warning("電卓: コピー用メモリの確保に失敗しました")
+        return False
+
+    data_pointer = kernel32.GlobalLock(data_handle)
+    if not data_pointer:
+        kernel32.GlobalFree(data_handle)
+        key_logger.warning("電卓: コピー用メモリをロックできませんでした")
+        return False
+
+    ctypes.memmove(data_pointer, encoded, len(encoded))
+    kernel32.GlobalUnlock(data_handle)
+
+    if not user32.OpenClipboard(hwnd):
+        kernel32.GlobalFree(data_handle)
+        key_logger.warning("電卓: コピー時にクリップボードを開けませんでした")
+        return False
+
+    transferred = False
+    try:
+        if not user32.EmptyClipboard():
+            key_logger.warning("電卓: クリップボードを空にできませんでした")
+            return False
+        if not user32.SetClipboardData(CF_UNICODETEXT, data_handle):
+            key_logger.warning("電卓: 計算結果をクリップボードへ設定できませんでした")
+            return False
+        transferred = True
+        return True
+    finally:
+        user32.CloseClipboard()
+        # SetClipboardData成功後はWindowsがメモリの所有権を持つ。
+        if not transferred:
+            kernel32.GlobalFree(data_handle)
+
+
+def _copy_displayed_result(hwnd):
+    """計算済みなら結果部分だけをクリップボードへコピーする。"""
+    result = _get_displayed_result(_text)
+    if result is None:
+        key_logger.info("電卓: コピー可能な計算結果がありません")
+        return
+    if _write_clipboard_text(hwnd, result):
+        key_logger.info(f"電卓: 計算結果をコピーしました (文字数={len(result)})")
+
+
 def _paste_clipboard_number(hwnd):
     """数値を結果表示の左側（式側）へ貼り付ける。"""
     global _text, _caret
@@ -409,6 +477,9 @@ def _frame_wnd_proc(hwnd, msg, wparam, lparam):
         _paint_frame(hwnd)
         return 0
     if msg == WM_KEYDOWN:
+        if wparam == VK_C and user32.GetKeyState(VK_CONTROL) & 0x8000:
+            _copy_displayed_result(hwnd)
+            return 0
         if wparam == VK_V and user32.GetKeyState(VK_CONTROL) & 0x8000:
             _paste_clipboard_number(hwnd)
             return 0

@@ -59,5 +59,32 @@ class PasteClipboardNumberTests(unittest.TestCase):
         self.assertEqual(len(calc_overlay._text), calc_overlay._caret)
 
 
+class CopyDisplayedResultTests(unittest.TestCase):
+    def test_extracts_only_result(self):
+        self.assertEqual("15", calc_overlay._get_displayed_result("10+5 = 15"))
+
+    def test_does_not_extract_uncomputed_expression(self):
+        self.assertIsNone(calc_overlay._get_displayed_result("10+5"))
+
+    def test_does_not_extract_error(self):
+        self.assertIsNone(calc_overlay._get_displayed_result("10/0 = エラー"))
+
+    def test_copies_result_text(self):
+        calc_overlay._text = "10/4 = 2.5"
+
+        with mock.patch.object(calc_overlay, "_write_clipboard_text", return_value=True) as write:
+            calc_overlay._copy_displayed_result(None)
+
+        write.assert_called_once_with(None, "2.5")
+
+    def test_does_not_overwrite_clipboard_without_result(self):
+        calc_overlay._text = "10/4"
+
+        with mock.patch.object(calc_overlay, "_write_clipboard_text") as write:
+            calc_overlay._copy_displayed_result(None)
+
+        write.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
