@@ -8,6 +8,7 @@ WindowsのEDITコントロールは可視スタイルのテーマ描画がWM_CTL
 削除もWM_CHAR/WM_KEYDOWNを自前でハンドリングする。
 
 Enterまたは"="キーで入力された式を評価し、「式 = 結果」の形で表示する。
+Ctrl+Cでは表示中の結果をコピーし、Ctrl+Vではクリップボードの数値を式側へ貼り付ける。
 Escキーで閉じる。
 
 式の評価は eval() を使わず、ast モジュールで四則演算のみを許可した
@@ -27,6 +28,9 @@ import ast
 import ctypes
 import ctypes.wintypes as wt
 import operator
+import re
+
+import key_logger
 
 user32   = ctypes.windll.user32
 gdi32    = ctypes.windll.gdi32
@@ -48,6 +52,7 @@ WM_KILLFOCUS     = 0x0008
 WM_ACTIVATE      = 0x0006
 WM_PAINT         = 0x000F
 WM_ERASEBKGND    = 0x0014
+WM_TIMER         = 0x0113
 WA_INACTIVE      = 0
 VK_RETURN        = 0x0D
 VK_ESCAPE        = 0x1B
@@ -56,6 +61,11 @@ VK_RIGHT         = 0x27
 VK_HOME          = 0x24
 VK_END           = 0x23
 VK_DELETE        = 0x2E
+VK_CONTROL       = 0x11
+VK_C             = 0x43
+VK_V             = 0x56
+CF_UNICODETEXT   = 13
+GMEM_MOVEABLE    = 0x0002
 MONITOR_DEFAULTTONEAREST = 0x00000002
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
 DWMWCP_ROUND = 2
@@ -64,6 +74,9 @@ WIDTH, HEIGHT = 560, 88
 CORNER_RADIUS = 20
 PADDING = 24
 CARET_WIDTH = 2
+COPY_STATUS_TIMER_ID = 1
+COPY_STATUS_DURATION_MS = 1500
+COPY_STATUS_WIDTH = 80
 
 # タスクトレイアイコン（assets/icon.svg）と揃えた配色
 COLOR_BG     = (0x1c, 0x1c, 0x1e)  # 背景（アイコンの背景と同色）
@@ -77,6 +90,17 @@ WNDPROCTYPE = ctypes.CFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt
 # OverflowErrorになるため明示的に型を指定する。
 user32.DefWindowProcW.restype  = ctypes.c_ssize_t
 user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.GetClipboardData.restype = wt.HANDLE
+user32.GetClipboardData.argtypes = [wt.UINT]
+user32.SetClipboardData.restype = wt.HANDLE
+user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+kernel32.GlobalAlloc.restype = wt.HGLOBAL
+kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+kernel32.GlobalFree.restype = wt.HGLOBAL
+kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -149,11 +173,13 @@ def safe_eval(expr: str):
 _frame_hwnd = None
 _frame_wndproc_ref = None
 _font       = None
+_status_font = None
 _bg_brush   = None
 _accent_pen = None
 
 _text  = ""   # 現在の入力文字列（自前管理、EDITコントロールは使わない）
 _caret = 0    # キャレット位置（文字インデックス）
+_status_text = ""  # コピー成功時などの一時ステータス
 
 
 def _get_active_monitor_work_area():
@@ -210,6 +236,154 @@ def _insert_char(ch):
     _text = _text[:_caret] + ch + _text[_caret:]
     _caret += 1
     _redraw()
+
+
+def _insert_text(text):
+    """キャレット位置へ文字列をまとめて挿入する。"""
+    global _text, _caret
+    _text = _text[:_caret] + text + _text[_caret:]
+    _caret += len(text)
+    _redraw()
+
+
+_NUMBER_PATTERN = re.compile(
+    r"[+-]?(?:(?:[0-9]{1,3}(?:,[0-9]{3})+)|[0-9]+)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?"
+    r"|[+-]?\.[0-9]+(?:[eE][+-]?[0-9]+)?"
+)
+
+
+def _normalize_clipboard_number(clipboard_text):
+    """貼り付け可能な数値なら、計算式に使える表記へ整えて返す。"""
+    candidate = clipboard_text.strip()
+    if not candidate or not _NUMBER_PATTERN.fullmatch(candidate):
+        return None
+    return candidate.replace(",", "")
+
+
+def _read_clipboard_text(hwnd):
+    """WindowsクリップボードからUnicode文字列を取得する。"""
+    if not user32.OpenClipboard(hwnd):
+        key_logger.warning("電卓: クリップボードを開けませんでした")
+        return None
+
+    data_handle = None
+    data_pointer = None
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            key_logger.info("電卓: クリップボードにテキストがありません")
+            return None
+        data_handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not data_handle:
+            key_logger.warning("電卓: クリップボードのテキスト取得に失敗しました")
+            return None
+        data_pointer = kernel32.GlobalLock(data_handle)
+        if not data_pointer:
+            key_logger.warning("電卓: クリップボードデータをロックできませんでした")
+            return None
+        return ctypes.wstring_at(data_pointer)
+    finally:
+        if data_pointer:
+            kernel32.GlobalUnlock(data_handle)
+        user32.CloseClipboard()
+
+
+def _get_displayed_result(text):
+    """「式 = 結果」の表示からコピー可能な結果だけを返す。"""
+    separator = " = "
+    if separator not in text:
+        return None
+    result = text.split(separator, 1)[1].strip()
+    if not result or result == "エラー":
+        return None
+    return result
+
+
+def _write_clipboard_text(hwnd, text):
+    """Unicode文字列をWindowsクリップボードへ書き込む。"""
+    encoded = text.encode("utf-16-le") + b"\x00\x00"
+    data_handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+    if not data_handle:
+        key_logger.warning("電卓: コピー用メモリの確保に失敗しました")
+        return False
+
+    data_pointer = kernel32.GlobalLock(data_handle)
+    if not data_pointer:
+        kernel32.GlobalFree(data_handle)
+        key_logger.warning("電卓: コピー用メモリをロックできませんでした")
+        return False
+
+    ctypes.memmove(data_pointer, encoded, len(encoded))
+    kernel32.GlobalUnlock(data_handle)
+
+    if not user32.OpenClipboard(hwnd):
+        kernel32.GlobalFree(data_handle)
+        key_logger.warning("電卓: コピー時にクリップボードを開けませんでした")
+        return False
+
+    transferred = False
+    try:
+        if not user32.EmptyClipboard():
+            key_logger.warning("電卓: クリップボードを空にできませんでした")
+            return False
+        if not user32.SetClipboardData(CF_UNICODETEXT, data_handle):
+            key_logger.warning("電卓: 計算結果をクリップボードへ設定できませんでした")
+            return False
+        transferred = True
+        return True
+    finally:
+        user32.CloseClipboard()
+        # SetClipboardData成功後はWindowsがメモリの所有権を持つ。
+        if not transferred:
+            kernel32.GlobalFree(data_handle)
+
+
+def _copy_displayed_result(hwnd):
+    """計算済みなら結果部分だけをクリップボードへコピーする。"""
+    result = _get_displayed_result(_text)
+    if result is None:
+        key_logger.info("電卓: コピー可能な計算結果がありません")
+        return
+    if _write_clipboard_text(hwnd, result):
+        _show_copy_status(hwnd)
+        key_logger.info(f"電卓: 計算結果をコピーしました (文字数={len(result)})")
+
+
+def _show_copy_status(hwnd):
+    """右端にコピー完了表示を出し、一定時間後に消す。"""
+    global _status_text
+    _status_text = "Copied"
+    user32.SetTimer(hwnd, COPY_STATUS_TIMER_ID, COPY_STATUS_DURATION_MS, None)
+    _redraw()
+
+
+def _clear_copy_status(hwnd):
+    global _status_text
+    user32.KillTimer(hwnd, COPY_STATUS_TIMER_ID)
+    if _status_text:
+        _status_text = ""
+        _redraw()
+
+
+def _paste_clipboard_number(hwnd):
+    """数値を結果表示の左側（式側）へ貼り付ける。"""
+    global _text, _caret
+    clipboard_text = _read_clipboard_text(hwnd)
+    if clipboard_text is None:
+        return
+
+    number = _normalize_clipboard_number(clipboard_text)
+    if number is None:
+        key_logger.info("電卓: 数値ではないクリップボード内容を無視しました")
+        return
+
+    # 計算済みなら結果部分を編集対象から外し、キャレットを必ず式内へ戻す。
+    if " = " in _text:
+        expression = _text.split(" = ", 1)[0]
+        _text = expression
+        _caret = min(_caret, len(expression))
+
+    _insert_text(number)
+    key_logger.info(f"電卓: クリップボードの数値を式へ貼り付けました (文字数={len(number)})")
 
 
 def _backspace():
@@ -294,10 +468,21 @@ def _paint_frame(hwnd):
     gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
     gdi32.SetTextColor(hdc, _rgb(COLOR_TEXT))
     old_font = gdi32.SelectObject(hdc, _font)
-    text_rc = wt.RECT(PADDING, 0, rc.right - PADDING, rc.bottom)
-    DT_LEFT, DT_VCENTER, DT_SINGLELINE = 0x0, 0x4, 0x20
+    status_space = COPY_STATUS_WIDTH if _status_text else 0
+    text_rc = wt.RECT(PADDING, 0, rc.right - PADDING - status_space, rc.bottom)
+    DT_LEFT, DT_RIGHT, DT_VCENTER, DT_SINGLELINE = 0x0, 0x2, 0x4, 0x20
     user32.DrawTextW(hdc, _text, -1, ctypes.byref(text_rc), DT_LEFT | DT_VCENTER | DT_SINGLELINE)
     gdi32.SelectObject(hdc, old_font)
+
+    if _status_text:
+        gdi32.SetTextColor(hdc, _rgb(COLOR_ACCENT))
+        old_status_font = gdi32.SelectObject(hdc, _status_font)
+        status_rc = wt.RECT(rc.right - PADDING - COPY_STATUS_WIDTH, 0, rc.right - PADDING, rc.bottom)
+        user32.DrawTextW(
+            hdc, _status_text, -1, ctypes.byref(status_rc),
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        )
+        gdi32.SelectObject(hdc, old_status_font)
 
     user32.EndPaint(hwnd, ctypes.byref(ps))
 
@@ -325,7 +510,16 @@ def _frame_wnd_proc(hwnd, msg, wparam, lparam):
     if msg == WM_PAINT:
         _paint_frame(hwnd)
         return 0
+    if msg == WM_TIMER and wparam == COPY_STATUS_TIMER_ID:
+        _clear_copy_status(hwnd)
+        return 0
     if msg == WM_KEYDOWN:
+        if wparam == VK_C and user32.GetKeyState(VK_CONTROL) & 0x8000:
+            _copy_displayed_result(hwnd)
+            return 0
+        if wparam == VK_V and user32.GetKeyState(VK_CONTROL) & 0x8000:
+            _paste_clipboard_number(hwnd)
+            return 0
         if wparam == VK_RETURN:
             _evaluate_current()
             return 0
@@ -367,7 +561,7 @@ def _frame_wnd_proc(hwnd, msg, wparam, lparam):
 
 
 def _ensure_window():
-    global _frame_hwnd, _frame_wndproc_ref, _font, _bg_brush, _accent_pen
+    global _frame_hwnd, _frame_wndproc_ref, _font, _status_font, _bg_brush, _accent_pen
     if _frame_hwnd:
         return
 
@@ -378,6 +572,10 @@ def _ensure_window():
     _accent_pen = gdi32.CreatePen(0, 2, _rgb(COLOR_ACCENT))  # PS_SOLID, 2px
     _font = gdi32.CreateFontW(
         -28, 0, 0, 0, 500, 0, 0, 0,
+        1, 0, 0, 0, 0, "Yu Gothic UI",
+    )
+    _status_font = gdi32.CreateFontW(
+        -16, 0, 0, 0, 600, 0, 0, 0,
         1, 0, 0, 0, 0, "Yu Gothic UI",
     )
 
@@ -419,6 +617,7 @@ def show_overlay():
     y = mon_top + (mon_h - HEIGHT) // 2
     user32.SetWindowPos(_frame_hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER)
 
+    _clear_copy_status(_frame_hwnd)
     _set_text("")
     _force_foreground(_frame_hwnd)
     user32.SetFocus(_frame_hwnd)
@@ -427,6 +626,7 @@ def show_overlay():
 def hide_overlay():
     """オーバーレイを非表示にする。"""
     if _frame_hwnd:
+        _clear_copy_status(_frame_hwnd)
         user32.ShowWindow(_frame_hwnd, SW_HIDE)
 
 
