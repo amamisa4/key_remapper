@@ -72,10 +72,14 @@ class CopyDisplayedResultTests(unittest.TestCase):
     def test_copies_result_text(self):
         calc_overlay._text = "10/4 = 2.5"
 
-        with mock.patch.object(calc_overlay, "_write_clipboard_text", return_value=True) as write:
+        with (
+            mock.patch.object(calc_overlay, "_write_clipboard_text", return_value=True) as write,
+            mock.patch.object(calc_overlay, "_show_copy_status") as show_status,
+        ):
             calc_overlay._copy_displayed_result(None)
 
         write.assert_called_once_with(None, "2.5")
+        show_status.assert_called_once_with(None)
 
     def test_does_not_overwrite_clipboard_without_result(self):
         calc_overlay._text = "10/4"
@@ -84,6 +88,17 @@ class CopyDisplayedResultTests(unittest.TestCase):
             calc_overlay._copy_displayed_result(None)
 
         write.assert_not_called()
+
+    def test_does_not_show_status_when_clipboard_write_fails(self):
+        calc_overlay._text = "10/4 = 2.5"
+
+        with (
+            mock.patch.object(calc_overlay, "_write_clipboard_text", return_value=False),
+            mock.patch.object(calc_overlay, "_show_copy_status") as show_status,
+        ):
+            calc_overlay._copy_displayed_result(None)
+
+        show_status.assert_not_called()
 
 
 if __name__ == "__main__":

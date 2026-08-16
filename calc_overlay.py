@@ -52,6 +52,7 @@ WM_KILLFOCUS     = 0x0008
 WM_ACTIVATE      = 0x0006
 WM_PAINT         = 0x000F
 WM_ERASEBKGND    = 0x0014
+WM_TIMER         = 0x0113
 WA_INACTIVE      = 0
 VK_RETURN        = 0x0D
 VK_ESCAPE        = 0x1B
@@ -73,6 +74,9 @@ WIDTH, HEIGHT = 560, 88
 CORNER_RADIUS = 20
 PADDING = 24
 CARET_WIDTH = 2
+COPY_STATUS_TIMER_ID = 1
+COPY_STATUS_DURATION_MS = 1500
+COPY_STATUS_WIDTH = 80
 
 # タスクトレイアイコン（assets/icon.svg）と揃えた配色
 COLOR_BG     = (0x1c, 0x1c, 0x1e)  # 背景（アイコンの背景と同色）
@@ -169,11 +173,13 @@ def safe_eval(expr: str):
 _frame_hwnd = None
 _frame_wndproc_ref = None
 _font       = None
+_status_font = None
 _bg_brush   = None
 _accent_pen = None
 
 _text  = ""   # 現在の入力文字列（自前管理、EDITコントロールは使わない）
 _caret = 0    # キャレット位置（文字インデックス）
+_status_text = ""  # コピー成功時などの一時ステータス
 
 
 def _get_active_monitor_work_area():
@@ -338,7 +344,24 @@ def _copy_displayed_result(hwnd):
         key_logger.info("電卓: コピー可能な計算結果がありません")
         return
     if _write_clipboard_text(hwnd, result):
+        _show_copy_status(hwnd)
         key_logger.info(f"電卓: 計算結果をコピーしました (文字数={len(result)})")
+
+
+def _show_copy_status(hwnd):
+    """右端にコピー完了表示を出し、一定時間後に消す。"""
+    global _status_text
+    _status_text = "Copied"
+    user32.SetTimer(hwnd, COPY_STATUS_TIMER_ID, COPY_STATUS_DURATION_MS, None)
+    _redraw()
+
+
+def _clear_copy_status(hwnd):
+    global _status_text
+    user32.KillTimer(hwnd, COPY_STATUS_TIMER_ID)
+    if _status_text:
+        _status_text = ""
+        _redraw()
 
 
 def _paste_clipboard_number(hwnd):
@@ -445,10 +468,21 @@ def _paint_frame(hwnd):
     gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
     gdi32.SetTextColor(hdc, _rgb(COLOR_TEXT))
     old_font = gdi32.SelectObject(hdc, _font)
-    text_rc = wt.RECT(PADDING, 0, rc.right - PADDING, rc.bottom)
-    DT_LEFT, DT_VCENTER, DT_SINGLELINE = 0x0, 0x4, 0x20
+    status_space = COPY_STATUS_WIDTH if _status_text else 0
+    text_rc = wt.RECT(PADDING, 0, rc.right - PADDING - status_space, rc.bottom)
+    DT_LEFT, DT_RIGHT, DT_VCENTER, DT_SINGLELINE = 0x0, 0x2, 0x4, 0x20
     user32.DrawTextW(hdc, _text, -1, ctypes.byref(text_rc), DT_LEFT | DT_VCENTER | DT_SINGLELINE)
     gdi32.SelectObject(hdc, old_font)
+
+    if _status_text:
+        gdi32.SetTextColor(hdc, _rgb(COLOR_ACCENT))
+        old_status_font = gdi32.SelectObject(hdc, _status_font)
+        status_rc = wt.RECT(rc.right - PADDING - COPY_STATUS_WIDTH, 0, rc.right - PADDING, rc.bottom)
+        user32.DrawTextW(
+            hdc, _status_text, -1, ctypes.byref(status_rc),
+            DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
+        )
+        gdi32.SelectObject(hdc, old_status_font)
 
     user32.EndPaint(hwnd, ctypes.byref(ps))
 
@@ -475,6 +509,9 @@ def _frame_wnd_proc(hwnd, msg, wparam, lparam):
         return 1  # WM_PAINTでまとめて塗るため既定の消去はしない
     if msg == WM_PAINT:
         _paint_frame(hwnd)
+        return 0
+    if msg == WM_TIMER and wparam == COPY_STATUS_TIMER_ID:
+        _clear_copy_status(hwnd)
         return 0
     if msg == WM_KEYDOWN:
         if wparam == VK_C and user32.GetKeyState(VK_CONTROL) & 0x8000:
@@ -524,7 +561,7 @@ def _frame_wnd_proc(hwnd, msg, wparam, lparam):
 
 
 def _ensure_window():
-    global _frame_hwnd, _frame_wndproc_ref, _font, _bg_brush, _accent_pen
+    global _frame_hwnd, _frame_wndproc_ref, _font, _status_font, _bg_brush, _accent_pen
     if _frame_hwnd:
         return
 
@@ -535,6 +572,10 @@ def _ensure_window():
     _accent_pen = gdi32.CreatePen(0, 2, _rgb(COLOR_ACCENT))  # PS_SOLID, 2px
     _font = gdi32.CreateFontW(
         -28, 0, 0, 0, 500, 0, 0, 0,
+        1, 0, 0, 0, 0, "Yu Gothic UI",
+    )
+    _status_font = gdi32.CreateFontW(
+        -16, 0, 0, 0, 600, 0, 0, 0,
         1, 0, 0, 0, 0, "Yu Gothic UI",
     )
 
@@ -576,6 +617,7 @@ def show_overlay():
     y = mon_top + (mon_h - HEIGHT) // 2
     user32.SetWindowPos(_frame_hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER)
 
+    _clear_copy_status(_frame_hwnd)
     _set_text("")
     _force_foreground(_frame_hwnd)
     user32.SetFocus(_frame_hwnd)
@@ -584,6 +626,7 @@ def show_overlay():
 def hide_overlay():
     """オーバーレイを非表示にする。"""
     if _frame_hwnd:
+        _clear_copy_status(_frame_hwnd)
         user32.ShowWindow(_frame_hwnd, SW_HIDE)
 
 
