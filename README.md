@@ -13,6 +13,7 @@ key_remapper/
 ├── virtual_desktop.py  # 仮想デスクトップ操作モジュール
 ├── window_resize.py    # ウィンドウリサイズモジュール
 ├── calc_overlay.py     # 電卓オーバーレイモジュール
+├── logs/               # 詳細な実行ログ
 └── start_remap.bat     # バックグラウンド起動用
 ```
 
@@ -37,8 +38,14 @@ key_remapper/
 | F1 | Win + H | 音声入力 |
 | Win + Esc | Media Play/Pause | 再生・一時停止 |
 | Ctrl + Space | Enter | Enterキー |
+| Alt + Space | 電卓オーバーレイ | 四則演算、数値の `Ctrl + V` 貼り付け |
 | Win + C | ブラウザで ChatGPT を開く | https://chatgpt.com/ |
 | Win + Y | ブラウザで YouTube を開く | https://www.youtube.com/ |
+
+### 電卓オーバーレイ
+
+`Alt + Space` で電卓を表示し、四則演算の式を入力して `Enter` または `=` で計算する。
+数値をコピーして `Ctrl + V` を押すと、キャレット位置へ貼り付けられる。計算結果が表示済みの場合も、数値は `=` の左側にある式へ挿入される。桁区切りのカンマ、小数、符号、指数表記に対応し、数値以外のクリップボード内容は無視する。
 
 ---
 
@@ -114,6 +121,7 @@ Ctrl + Shift + Esc → 詳細 → pythonw.exe → タスクの終了
 - 本スクリプトはOSレベルで全キー入力を監視する。セキュリティソフトが警告を出す場合がある。
 - `Win + C` および `Win + Y` はブラウザを起動するため、`subprocess` を使用している。
 - リマップ対象キーのキーアップイベントはOSに渡さず破棄する設計になっている。
+- 詳細な実行ログは `logs/key_remapper.log` に出力される。
 
 
 ## exe化

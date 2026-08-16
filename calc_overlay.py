@@ -8,6 +8,7 @@ WindowsのEDITコントロールは可視スタイルのテーマ描画がWM_CTL
 削除もWM_CHAR/WM_KEYDOWNを自前でハンドリングする。
 
 Enterまたは"="キーで入力された式を評価し、「式 = 結果」の形で表示する。
+Ctrl+Vではクリップボードの数値を式側へ貼り付ける。
 Escキーで閉じる。
 
 式の評価は eval() を使わず、ast モジュールで四則演算のみを許可した
@@ -27,6 +28,9 @@ import ast
 import ctypes
 import ctypes.wintypes as wt
 import operator
+import re
+
+import key_logger
 
 user32   = ctypes.windll.user32
 gdi32    = ctypes.windll.gdi32
@@ -56,6 +60,9 @@ VK_RIGHT         = 0x27
 VK_HOME          = 0x24
 VK_END           = 0x23
 VK_DELETE        = 0x2E
+VK_CONTROL       = 0x11
+VK_V             = 0x56
+CF_UNICODETEXT   = 13
 MONITOR_DEFAULTTONEAREST = 0x00000002
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
 DWMWCP_ROUND = 2
@@ -77,6 +84,11 @@ WNDPROCTYPE = ctypes.CFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt
 # OverflowErrorになるため明示的に型を指定する。
 user32.DefWindowProcW.restype  = ctypes.c_ssize_t
 user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.GetClipboardData.restype = wt.HANDLE
+user32.GetClipboardData.argtypes = [wt.UINT]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [wt.HGLOBAL]
+kernel32.GlobalUnlock.argtypes = [wt.HGLOBAL]
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -212,6 +224,77 @@ def _insert_char(ch):
     _redraw()
 
 
+def _insert_text(text):
+    """キャレット位置へ文字列をまとめて挿入する。"""
+    global _text, _caret
+    _text = _text[:_caret] + text + _text[_caret:]
+    _caret += len(text)
+    _redraw()
+
+
+_NUMBER_PATTERN = re.compile(
+    r"[+-]?(?:(?:[0-9]{1,3}(?:,[0-9]{3})+)|[0-9]+)(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?"
+    r"|[+-]?\.[0-9]+(?:[eE][+-]?[0-9]+)?"
+)
+
+
+def _normalize_clipboard_number(clipboard_text):
+    """貼り付け可能な数値なら、計算式に使える表記へ整えて返す。"""
+    candidate = clipboard_text.strip()
+    if not candidate or not _NUMBER_PATTERN.fullmatch(candidate):
+        return None
+    return candidate.replace(",", "")
+
+
+def _read_clipboard_text(hwnd):
+    """WindowsクリップボードからUnicode文字列を取得する。"""
+    if not user32.OpenClipboard(hwnd):
+        key_logger.warning("電卓: クリップボードを開けませんでした")
+        return None
+
+    data_handle = None
+    data_pointer = None
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            key_logger.info("電卓: クリップボードにテキストがありません")
+            return None
+        data_handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not data_handle:
+            key_logger.warning("電卓: クリップボードのテキスト取得に失敗しました")
+            return None
+        data_pointer = kernel32.GlobalLock(data_handle)
+        if not data_pointer:
+            key_logger.warning("電卓: クリップボードデータをロックできませんでした")
+            return None
+        return ctypes.wstring_at(data_pointer)
+    finally:
+        if data_pointer:
+            kernel32.GlobalUnlock(data_handle)
+        user32.CloseClipboard()
+
+
+def _paste_clipboard_number(hwnd):
+    """数値を結果表示の左側（式側）へ貼り付ける。"""
+    global _text, _caret
+    clipboard_text = _read_clipboard_text(hwnd)
+    if clipboard_text is None:
+        return
+
+    number = _normalize_clipboard_number(clipboard_text)
+    if number is None:
+        key_logger.info("電卓: 数値ではないクリップボード内容を無視しました")
+        return
+
+    # 計算済みなら結果部分を編集対象から外し、キャレットを必ず式内へ戻す。
+    if " = " in _text:
+        expression = _text.split(" = ", 1)[0]
+        _text = expression
+        _caret = min(_caret, len(expression))
+
+    _insert_text(number)
+    key_logger.info(f"電卓: クリップボードの数値を式へ貼り付けました (文字数={len(number)})")
+
+
 def _backspace():
     global _text, _caret
     if _caret > 0:
@@ -326,6 +409,9 @@ def _frame_wnd_proc(hwnd, msg, wparam, lparam):
         _paint_frame(hwnd)
         return 0
     if msg == WM_KEYDOWN:
+        if wparam == VK_V and user32.GetKeyState(VK_CONTROL) & 0x8000:
+            _paste_clipboard_number(hwnd)
+            return 0
         if wparam == VK_RETURN:
             _evaluate_current()
             return 0
